@@ -12,6 +12,7 @@ Memory: TF-IDF is built in two streaming passes and held on the GPU (tfidf_utils
 system available RAM drops below --min-avail-gb.
 """
 import argparse
+import json
 import os
 import re
 import time
@@ -34,7 +35,11 @@ def parse_args():
     p.add_argument("--split", required=True, choices=["train", "test"])
     p.add_argument("--cache-dir", default=None, help="Cache with norm_{split}_source*.parquet (default: config.CACHE_DIR)")
     p.add_argument("--out-dir", default=None, help="Where tfidf_{split}_{source}.parquet and tfidf_parts/ go (default: cache dir)")
-    p.add_argument("--k", type=int, default=10)
+    p.add_argument("--mode", default="fwd", choices=["fwd", "rev", "dict"],
+                   help="fwd: S1 -> S2/S3 top-k (Channel I); rev: S2/S3 -> S1 top-k (Channel J); "
+                        "dict: fwd with dictionary-mapped S2/S3 names (Channel K)")
+    p.add_argument("--dict", default=None, help="dict mode: token map JSON (default cache/indic_dict.json)")
+    p.add_argument("--k", type=int, default=None, help="top-k per query (default: fwd/dict 10, rev 5)")
     p.add_argument("--max-features", type=int, default=300_000)
     p.add_argument("--text", default="nsa", choices=["nsa", "na"])
     p.add_argument("--fp32", action="store_true", help="fp32 SpMM (default fp16: ~1.5x faster, same recall@10 +-1 pair)")
@@ -54,6 +59,14 @@ def _read_norm(cache_dir, split, source):
     return pq.read_table(os.path.join(cache_dir, f"norm_{split}_{source}.parquet"), columns=NORM_COLS)
 
 
+MODES = {
+    # mode: output file prefix, column names, default k, which side is queried
+    "fwd": dict(prefix="tfidf", cols=("s1_id", "cand_id", "tfidf_score", "tfidf_rank"), k=10, query="s1"),
+    "rev": dict(prefix="tfidf_rev", cols=("cand_id", "s1_id", "score", "rank"), k=5, query="src"),
+    "dict": dict(prefix="tfidf_dict", cols=("s1_id", "cand_id", "score", "rank"), k=10, query="s1"),
+}
+
+
 def main():
     a = parse_args()
     if a.cache_dir is None:
@@ -62,12 +75,20 @@ def main():
     out_dir = a.out_dir or a.cache_dir
     if (a.limit or a.pool_limit or a.s1_list) and os.path.realpath(out_dir) == os.path.realpath(a.cache_dir):
         raise SystemExit("--limit/--pool-limit/--s1-list are test options: pass --out-dir outside the cache dir")
+    mode = MODES[a.mode]
+    k_req = a.k or mode["k"]
+    name_map = None
+    if a.mode == "dict":
+        dict_path = a.dict or os.path.join(a.cache_dir, "indic_dict.json")
+        with open(dict_path, encoding="utf-8") as f:
+            name_map = json.load(f)
+        print(f"Loaded name dictionary {dict_path}: {len(name_map):,} token mappings", flush=True)
     parts_dir = os.path.join(out_dir, "tfidf_parts")
     os.makedirs(parts_dir, exist_ok=True)
     fp16 = not a.fp32
     dev = "cuda"
     t_start = time.time()
-    print(f"=== Stage 3c: Channel I char TF-IDF ({a.split}) === text={a.text} k={a.k} "
+    print(f"=== Stage 3c: char TF-IDF mode={a.mode} ({a.split}) === text={a.text} k={k_req} "
           f"{'fp16' if fp16 else 'fp32'} max_features={a.max_features:,} limit={a.limit} pool_limit={a.pool_limit}")
     print(f"cache: {a.cache_dir} | out: {out_dir} | RSS {rss_gb():.2f} GB", flush=True)
 
@@ -77,31 +98,30 @@ def main():
     s1_countries = sorted(c for c in pc.unique(s1_tbl["country"]).to_pylist() if c and str(c).strip())
     print(f"S1: {s1_tbl.num_rows:,} rows, countries: {s1_countries}", flush=True)
 
-    # Plan every (source, country) part and total query count for the ETA
+    # Plan every (source, country) part; --limit caps the query side, --pool-limit the indexed side
     plan = []
     for source in SOURCES:
-        final_p = os.path.join(out_dir, f"tfidf_{a.split}_{source}.parquet")
+        final_p = os.path.join(out_dir, f"{mode['prefix']}_{a.split}_{source}.parquet")
         src_tbl = _read_norm(a.cache_dir, a.split, source)
         src_counts = dict(zip(*[x.to_pylist() for x in pc.value_counts(src_tbl["country"]).flatten()]))
         del src_tbl
         for c in s1_countries:
-            n_pool = src_counts.get(c, 0)
-            if n_pool == 0:
+            n_src = src_counts.get(c, 0)
+            if n_src == 0:
                 print(f"  skip {source}/{c}: no {source} records", flush=True)
                 continue
-            n_q = int(pc.sum(pc.equal(s1_tbl["country"], c)).as_py())
-            if a.limit:
-                n_q = min(n_q, a.limit)
-            if a.pool_limit:
-                n_pool = min(n_pool, a.pool_limit)
-            part_p = os.path.join(parts_dir, f"{a.split}_{source}_{_safe(c)}.parquet")
-            plan.append(dict(source=source, country=c, n_q=n_q, n_pool=n_pool, part=part_p, final=final_p,
+            n_s1 = int(pc.sum(pc.equal(s1_tbl["country"], c)).as_py())
+            n_q, n_idx = (n_s1, n_src) if mode["query"] == "s1" else (n_src, n_s1)
+            n_q = min(n_q, a.limit) if a.limit else n_q
+            n_idx = min(n_idx, a.pool_limit) if a.pool_limit else n_idx
+            tag = "" if a.mode == "fwd" else f"{a.mode}_"
+            part_p = os.path.join(parts_dir, f"{tag}{a.split}_{source}_{_safe(c)}.parquet")
+            plan.append(dict(source=source, country=c, n_q=n_q, n_pool=n_idx, part=part_p, final=final_p,
                              done=os.path.exists(part_p) or os.path.exists(final_p)))
-    # work ~ queries x pool size (SpMM cost), used to weight the ETA
     total_work = sum(p["n_q"] * p["n_pool"] for p in plan if not p["done"])
     print("Plan:")
     for p in plan:
-        print(f"  {p['source']:8} {p['country']:10} queries {p['n_q']:>10,} pool {p['n_pool']:>10,} "
+        print(f"  {p['source']:8} {p['country']:10} queries {p['n_q']:>10,} index {p['n_pool']:>10,} "
               f"{'DONE (resume skip)' if p['done'] else ''}")
     print(flush=True)
 
@@ -119,20 +139,33 @@ def main():
             cur_source = p["source"]
         c = p["country"]
         s1_c = s1_tbl.filter(pc.equal(s1_tbl["country"], c)).to_pandas()
-        pool_c = src_tbl.filter(pc.equal(src_tbl["country"], c)).to_pandas()
+        src_c = src_tbl.filter(pc.equal(src_tbl["country"], c)).to_pandas()
+        if mode["query"] == "s1":
+            q_df, idx_df = s1_c, src_c
+        else:
+            q_df, idx_df = src_c, s1_c
         if a.pool_limit:
-            pool_c = pool_c.iloc[:a.pool_limit]
-        q_c = s1_c.iloc[:a.limit] if a.limit else s1_c
-        if a.limit or a.pool_limit:
-            s1_c = q_c                      # test mode: fit on the limited subsets only
-        print(f"--- {p['source']} / {c}: fit {len(s1_c):,} S1 + {len(pool_c):,} {p['source']} | "
-              f"queries {len(q_c):,} | RSS {rss_gb():.2f} GB", flush=True)
+            idx_df = idx_df.iloc[:a.pool_limit]
+        if a.limit:
+            q_df = q_df.iloc[:a.limit]
+        if a.limit or a.pool_limit:            # test mode: fit on the limited subsets only
+            s1_c, src_c = (q_df, idx_df) if mode["query"] == "s1" else (idx_df, q_df)
+        print(f"--- {p['source']} / {c}: fit {len(s1_c):,} S1 + {len(src_c):,} {p['source']} | "
+              f"queries {len(q_df):,} ({'S1' if mode['query'] == 's1' else p['source']}) | index {len(idx_df):,} | "
+              f"RSS {rss_gb():.2f} GB", flush=True)
 
-        fit_docs = [make_texts(s1_c, a.text), make_texts(pool_c, a.text)]
-        (Gq, Gp), _ = build_tfidf_gpu(fit_docs, [make_texts(q_c, a.text), fit_docs[1]],
+        s1_txt = make_texts(s1_c, a.text)
+        src_txt = make_texts(src_c, a.text, name_map)
+        if mode["query"] == "s1":
+            q_txt = s1_txt if len(q_df) == len(s1_c) else make_texts(q_df, a.text)
+            idx_txt = src_txt
+        else:
+            q_txt = src_txt if len(q_df) == len(src_c) else make_texts(q_df, a.text, name_map)
+            idx_txt = s1_txt
+        (Gq, Gp), _ = build_tfidf_gpu([s1_txt, src_txt], [q_txt, idx_txt],
                                       max_features=a.max_features, device=dev, min_avail_gb=a.min_avail_gb,
                                       log=lambda m: print(m, flush=True))
-        del fit_docs
+        del s1_txt, src_txt, q_txt, idx_txt
         chunk = min(a.chunk, auto_chunk(Gp.shape[0], fp16, 2.0, 1024))
         n_q = Gq.shape[0]
         t_s = time.time()
@@ -146,7 +179,7 @@ def main():
             qps = done / max(1e-9, now - t_s)
             part_eta = (n_q - done) / max(qps, 1e-9)
             wd = work_done + done * Gp.shape[0]
-            rate = wd / max(1e-9, now - t_work)          # query x pool-row per second, overall
+            rate = wd / max(1e-9, now - t_work)          # query x index-row per second, overall
             all_eta = (total_work - wd) / max(rate, 1e-9)
             print(f"    {p['source']}/{c}: {done:,}/{n_q:,} queries | {qps:,.0f} q/s | part ETA {part_eta / 60:.1f} min | "
                   f"split ETA {all_eta / 60:.1f} min | RSS {rss_gb():.2f} GB | GPU "
@@ -154,30 +187,31 @@ def main():
                   flush=True)
             wait_for_memory(a.min_avail_gb, f"{p['source']}/{c} search")
 
-        idx, sc = gpu_topk(Gp, Gq, a.k, chunk, fp16, progress)
+        idx, sc = gpu_topk(Gp, Gq, k_req, chunk, fp16, progress)
         k = idx.shape[1]
-        pool_ids = pool_c["entity_id"].to_numpy()
+        idx_ids = idx_df["entity_id"].to_numpy()
         keep = sc.ravel() > 0
+        c_q, c_idx, c_score, c_rank = mode["cols"]
         part = pa.table({
-            "s1_id": pa.array(np.repeat(q_c["entity_id"].to_numpy(), k)[keep]),
-            "cand_id": pa.array(pool_ids[idx.ravel()][keep]),
-            "tfidf_score": pa.array(sc.ravel()[keep].astype(np.float32)),
-            "tfidf_rank": pa.array(np.tile(np.arange(1, k + 1, dtype=np.int8), n_q)[keep]),
+            c_q: pa.array(np.repeat(q_df["entity_id"].to_numpy(), k)[keep]),
+            c_idx: pa.array(idx_ids[idx.ravel()][keep]),
+            c_score: pa.array(sc.ravel()[keep].astype(np.float32)),
+            c_rank: pa.array(np.tile(np.arange(1, k + 1, dtype=np.int8), n_q)[keep]),
         })
         tmp = p["part"] + ".tmp"
         pq.write_table(part, tmp)
         os.replace(tmp, p["part"])
         work_done += n_q * Gp.shape[0]
-        print(f"  saved {p['part']}: {part.num_rows:,} pairs ({part.num_rows / max(1, n_q):.2f}/S1) | "
+        print(f"  saved {p['part']}: {part.num_rows:,} pairs ({part.num_rows / max(1, n_q):.2f}/query) | "
               f"{n_q / max(1e-9, time.time() - t_s):,.0f} q/s search | part {time.time() - t_part:.0f}s | "
               f"RSS {rss_gb():.2f} GB", flush=True)
-        del Gq, Gp, idx, sc, part, s1_c, pool_c, q_c
+        del Gq, Gp, idx, sc, part, s1_c, src_c, q_df, idx_df
         torch.cuda.empty_cache()
 
-    # Assemble tfidf_{split}_{source}.parquet from its parts
+    # Assemble {prefix}_{split}_{source}.parquet from its parts
     for source in SOURCES:
         src_plan = [p for p in plan if p["source"] == source]
-        final_p = os.path.join(out_dir, f"tfidf_{a.split}_{source}.parquet")
+        final_p = os.path.join(out_dir, f"{mode['prefix']}_{a.split}_{source}.parquet")
         if not src_plan or os.path.exists(final_p):
             continue
         missing = [p["part"] for p in src_plan if not os.path.exists(p["part"])]
@@ -187,10 +221,11 @@ def main():
         tbl = pa.concat_tables([pq.read_table(p["part"]) for p in src_plan])
         pq.write_table(tbl, final_p + ".tmp")
         os.replace(final_p + ".tmp", final_p)
-        print(f"Wrote {final_p}: {tbl.num_rows:,} pairs, {len(pc.unique(tbl['s1_id'])):,} S1", flush=True)
+        print(f"Wrote {final_p}: {tbl.num_rows:,} pairs, {len(pc.unique(tbl['s1_id'])):,} S1, "
+              f"{len(pc.unique(tbl['cand_id'])):,} {source} records", flush=True)
         del tbl
 
-    print(f"\nStage 3c ({a.split}) finished in {(time.time() - t_start) / 60:.1f} min | RSS {rss_gb():.2f} GB", flush=True)
+    print(f"\nStage 3c mode={a.mode} ({a.split}) finished in {(time.time() - t_start) / 60:.1f} min | RSS {rss_gb():.2f} GB", flush=True)
 
 
 if __name__ == "__main__":

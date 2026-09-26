@@ -41,13 +41,15 @@ def wait_for_memory(min_avail_gb: float, where: str = "", poll_s: int = 30) -> N
     print(f"  RESUMED after {time.time() - t0:.0f}s (available {avail_gb():.1f} GB)", flush=True)
 
 
-def make_texts(df, variant: str = "na") -> list:
+def make_texts(df, variant: str = "na", name_map: dict = None) -> list:
     """
     variant 'nsa' (Channel I default): name_full + ' ' + name_skel + ' ' + addr_norm.
     variant 'na': name_full + ' ' + addr_norm.
     char_wb n-grams are built per word, so word order does not change the vectors.
     """
     name = df["name_full"].fillna("").astype(str)
+    if name_map:        # Channel K: token dictionary applied to a copy of the name (name_full itself is never changed)
+        name = name.map(lambda s: " ".join(name_map.get(tok, tok) for tok in s.split()))
     addr = df["addr_norm"].fillna("").astype(str)
     if variant == "na":
         return (name + " " + addr).tolist()
