@@ -70,6 +70,8 @@ FEATURES = [
     "ch_rerank",
     "ch_keyx",
     "ch_comb",
+    "ch_tfidf",
+    "tfidf_rank",
     "n_channels",
     # Context Features
     "gap_to_best",
