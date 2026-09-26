@@ -6,6 +6,7 @@ import argparse
 from collections import defaultdict, Counter
 import numpy as np
 import pandas as pd
+import pyarrow as pa
 import pyarrow.parquet as pq
 from rapidfuzz import process, fuzz
 
@@ -23,6 +24,49 @@ def _rss_mb() -> float:
     if _HAS_PSUTIL:
         return psutil.Process(os.getpid()).memory_info().rss / 1_048_576
     return -1.0
+
+
+# Max candidate rows per feature sub-batch inside one chunk. Sub-batches always hold
+# whole S1 candidate lists, so per-S1 context features are exact.
+SUB_BATCH_MAX_ROWS = 1_000_000
+
+
+def _free_memory():
+    """Runs GC and returns freed heap pages (glibc + Arrow pool) to the OS."""
+    import gc
+    gc.collect()
+    try:
+        pa.default_memory_pool().release_unused()
+    except Exception:
+        pass
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
+def _s1_sub_batches(s1_series: pd.Series, max_rows: int):
+    """
+    Groups rows into sub-batches of at most max_rows rows without splitting any S1
+    (an S1 with more than max_rows candidates gets a batch of its own).
+    S1 are packed greedily in order of first appearance.
+    Returns: list of int64 row-index arrays (ascending within each batch).
+    """
+    codes, _ = pd.factorize(s1_series, sort=False)
+    counts = np.bincount(codes)
+    batch_of_s1 = np.empty(len(counts), dtype=np.int64)
+    cur, acc = 0, 0
+    for i, c in enumerate(counts):
+        if acc > 0 and acc + c > max_rows:
+            cur += 1
+            acc = 0
+        batch_of_s1[i] = cur
+        acc += c
+    row_batch = batch_of_s1[codes]
+    order = np.argsort(row_batch, kind='stable')
+    bounds = np.searchsorted(row_batch[order], np.arange(cur + 2))
+    return [order[bounds[b]:bounds[b + 1]] for b in range(cur + 1)]
 
 
 def _id_to_int(series: pd.Series, validate: bool = True) -> pd.Series:
@@ -107,6 +151,8 @@ def parse_args():
     parser.add_argument("--force", action="store_true", help="Overwrite existing feature parquet files")
     parser.add_argument("--count-only", action="store_true", help="Print number of feature rows and unique IDs, then exit")
     parser.add_argument("--max-chunks", type=int, default=None, help="Process only the first N feature chunks")
+    parser.add_argument("--sub-batch-rows", type=int, default=SUB_BATCH_MAX_ROWS,
+                        help="Max candidate rows per sub-batch inside a chunk (whole S1 groups only)")
     return parser.parse_args()
 
 
@@ -1036,52 +1082,74 @@ def main():
             continue
 
         # Context: ALL rows for S1 IDs that have any kept row
-        # This gives us the full 40-candidate list for competitor S1
+        # This gives us the full candidate list for competitor S1
         context_mask = chunk_full['s1_id'].isin(kept_s1_set).values
         context_df = chunk_full[context_mask].reset_index(drop=True)
-
-        # Compute per-S1 context features on full candidate lists
-        ctx_gap, ctx_nc, ctx_sup = compute_context_features(
-            context_df, all_cand_emb, cand_id_map
-        )
-
-        # Map keep_mask from full chunk to context rows
-        keep_in_context = keep_mask[context_mask]
-
-        # Filter context to only kept rows
-        kept_df = context_df[keep_in_context].reset_index(drop=True)
-        kept_rr = chunk_rr[keep_mask]
-        kept_df['is_competitor'] = is_comp[keep_mask].astype(np.int8)
-
-        # Slice context features to only kept rows
-        kept_gap = ctx_gap[keep_in_context]
-        kept_nc = ctx_nc[keep_in_context]
-        kept_sup = ctx_sup[keep_in_context]
-        del context_df, ctx_gap, ctx_nc, ctx_sup
-
-        n_sampled = int((kept_df['is_competitor'] == 0).sum())
-        n_comp = int((kept_df['is_competitor'] == 1).sum())
-        print(f"  Context: {n_before:,} -> {context_mask.sum():,} rows (full S1 lists), "
-              f"kept: {len(kept_df):,} (sampled: {n_sampled:,}, competitor: {n_comp:,})", flush=True)
-
-        feats_df = compute_chunk_features(
-            kept_df, s1_norm, cands_norm, all_cand_emb, cand_id_map,
-            kept_rr, df_tokens, kept_gap, kept_nc, kept_sup
-        )
-
-        feats_df.to_parquet(out_p, index=False)
-
-        # Free this chunk's reverse rank and masks immediately
+        ctx_keep = keep_mask[context_mask]
+        ctx_rr = chunk_rr[context_mask]
+        ctx_comp = is_comp[context_mask]
+        n_context = len(context_df)
+        del chunk_full
         chunk_rr_list[idx] = None
         chunk_keep_masks[idx] = None
         chunk_is_comps[idx] = None
 
+        # Position of each kept row in the unbatched kept order (= old output row order)
+        kept_pos = np.cumsum(ctx_keep) - 1
+        n_kept = int(ctx_keep.sum())
+        n_comp = int(ctx_comp[ctx_keep].sum())
+        print(f"  Context: {n_before:,} -> {n_context:,} rows (full S1 lists), "
+              f"kept: {n_kept:,} (sampled: {n_kept - n_comp:,}, competitor: {n_comp:,})", flush=True)
+
+        # Sub-batches of whole S1 groups: context features (gap_to_best, n_cands, support)
+        # only depend on the S1's own candidate list, so they are exact per sub-batch.
+        batches = _s1_sub_batches(context_df['s1_id'], args.sub_batch_rows)
+        part_tables = []
+        part_pos = []
+        for bi, rows in enumerate(batches):
+            t_sb = time.time()
+            sub_ctx = context_df.iloc[rows].reset_index(drop=True)
+            ctx_gap, ctx_nc, ctx_sup = compute_context_features(sub_ctx, all_cand_emb, cand_id_map)
+            sub_keep = ctx_keep[rows]
+            if sub_keep.any():
+                kept_df = sub_ctx[sub_keep].reset_index(drop=True)
+                kept_df['is_competitor'] = ctx_comp[rows][sub_keep].astype(np.int8)
+                feats_df = compute_chunk_features(
+                    kept_df, s1_norm, cands_norm, all_cand_emb, cand_id_map,
+                    ctx_rr[rows][sub_keep], df_tokens,
+                    ctx_gap[sub_keep], ctx_nc[sub_keep], ctx_sup[sub_keep]
+                )
+                part_tables.append(pa.Table.from_pandas(feats_df, preserve_index=False))
+                part_pos.append(kept_pos[rows][sub_keep])
+                n_sb_kept = len(kept_df)
+                del kept_df, feats_df
+            else:
+                n_sb_kept = 0
+            del sub_ctx, ctx_gap, ctx_nc, ctx_sup, sub_keep
+            _free_memory()
+            print(f"    Sub-batch {bi + 1}/{len(batches)}: {len(rows):,} context rows, "
+                  f"{n_sb_kept:,} feature rows in {time.time() - t_sb:.2f}s  (RSS {_rss_mb():.0f} MB)", flush=True)
+
+        del context_df, ctx_keep, ctx_rr, ctx_comp, kept_pos, batches
+        _free_memory()
+
+        # Reassemble in the original kept-row order and write
+        feats_tbl = pa.concat_tables(part_tables)
+        del part_tables
+        pos = np.concatenate(part_pos)
+        del part_pos
+        if not np.all(pos[1:] > pos[:-1]):
+            feats_tbl = feats_tbl.take(pa.array(np.argsort(pos, kind='stable')))
+        n_feats = feats_tbl.num_rows
+        pq.write_table(feats_tbl, out_p)
+        del feats_tbl, pos
+
         rss_aft = _rss_mb()
-        print(f"Saved chunk {idx + 1}/{len(chunk_files)} features ({len(feats_df):,} pairs) to {out_p} "
+        print(f"Saved chunk {idx + 1}/{len(chunk_files)} features ({n_feats:,} pairs) to {out_p} "
               f"in {time.time() - t_ch:.2f}s  (RSS {rss_aft:.0f} MB)", flush=True)
 
-        del chunk_full, context_mask, kept_df, kept_gap, kept_nc, kept_sup, feats_df
-        import gc; gc.collect()
+        del context_mask
+        _free_memory()
 
     t_feat_total = time.time() - t_feat_start
 

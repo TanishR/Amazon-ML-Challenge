@@ -92,6 +92,44 @@ def load_ordered_s1_ids(test_dir: str, cache_dir: str, is_laptop: bool) -> List[
     return s1_ids
 
 
+def _as_id_list(ids) -> List[str]:
+    """Returns an ID list from either a list or a comma-joined ID string."""
+    if isinstance(ids, str):
+        return ids.split(",") if ids else []
+    return ids
+
+
+def load_candidate_map(chunk_files: List[str], filter_s1_set: Optional[Set[str]] = None) -> Tuple[Dict[str, str], int]:
+    """
+    Reads candidate chunk files one by one and builds {s1_id: "cand1,cand2,..."} with
+    candidates deduplicated in first-seen order.
+    Stores one joined string per S1 instead of a list of Python strings: at ~70 candidates/S1
+    across 1.7M test S1 the list form takes ~18.6 GB (165 B per pair); joined strings ~1.4 GB.
+    Returns: (cand_map, total_pairs_loaded).
+    """
+    cand_map: Dict[str, str] = {}
+    total_pairs_loaded = 0
+    for ci, cf in enumerate(chunk_files):
+        cdf = pd.read_parquet(cf, columns=["s1_id", "cand_id"])
+        if filter_s1_set is not None:
+            cdf = cdf[cdf["s1_id"].isin(filter_s1_set)]
+
+        # Group candidates for this chunk without building a global string DataFrame
+        for sid, grp in cdf.groupby("s1_id", sort=False):
+            c_ids = list(dict.fromkeys(grp["cand_id"].values))
+            if sid in cand_map:
+                c_ids = list(dict.fromkeys(_as_id_list(cand_map[sid]) + c_ids))
+            cand_map[sid] = ",".join(c_ids)
+
+        total_pairs_loaded += len(cdf)
+        del cdf
+        import gc; gc.collect()
+        rss = _rss_mb()
+        print(f"  [candidate_pairs] Read chunk {ci + 1}/{len(chunk_files)}: {os.path.basename(cf)}  "
+              f"(accumulated {len(cand_map):,} S1 entities, RSS {rss:.0f} MB)", flush=True)
+    return cand_map, total_pairs_loaded
+
+
 def write_submission_tsv(
     filepath: str,
     header: str,
@@ -109,7 +147,7 @@ def write_submission_tsv(
     with open(filepath, "w", encoding="utf-8", newline="\n") as f:
         f.write(header + "\n")
         for s1 in s1_order:
-            ids = id_map.get(s1, [])
+            ids = _as_id_list(id_map.get(s1, []))
             # Deduplicate preserving order
             deduped = list(dict.fromkeys(ids))
             total_ids += len(deduped)
@@ -137,7 +175,7 @@ def assert_submission_integrity(
 
     for s1 in s1_order:
         matches = match_map.get(s1, [])
-        cands = cand_map.get(s1, [])
+        cands = _as_id_list(cand_map.get(s1, []))
 
         match_set = set(matches)
         cand_set = set(cands)
@@ -363,29 +401,7 @@ def main():
     print(f"Reading candidate pairs chunk-by-chunk across {len(chunk_files)} chunk file(s)...", flush=True)
     filter_s1_set = set(s1_order) if (args.laptop_test and args.split == "test") else None
 
-    cand_map: Dict[str, List[str]] = {}
-    total_pairs_loaded = 0
-    for ci, cf in enumerate(chunk_files):
-        t_cf = time.time()
-        cdf = pd.read_parquet(cf, columns=["s1_id", "cand_id"])
-        if filter_s1_set is not None:
-            cdf = cdf[cdf["s1_id"].isin(filter_s1_set)]
-
-        # Group candidates for this chunk without building a global string DataFrame
-        for sid, grp in cdf.groupby("s1_id", sort=False):
-            c_ids = list(dict.fromkeys(grp["cand_id"].values))
-            if sid in cand_map:
-                cand_map[sid].extend(c_ids)
-                cand_map[sid] = list(dict.fromkeys(cand_map[sid]))
-            else:
-                cand_map[sid] = c_ids
-
-        total_pairs_loaded += len(cdf)
-        del cdf
-        import gc; gc.collect()
-        rss = _rss_mb()
-        print(f"  [candidate_pairs] Read chunk {ci + 1}/{len(chunk_files)}: {os.path.basename(cf)}  "
-              f"(accumulated {len(cand_map):,} S1 entities, RSS {rss:.0f} MB)", flush=True)
+    cand_map, total_pairs_loaded = load_candidate_map(chunk_files, filter_s1_set)
 
     print(f"Loaded candidate pairs for {len(cand_map):,} total S1 entities ({total_pairs_loaded:,} pairs, RSS {_rss_mb():.0f} MB).", flush=True)
 
