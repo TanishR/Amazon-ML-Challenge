@@ -210,6 +210,128 @@ def apply_channel_i(
 FGH_FLAGS = ("ch_rerank", "ch_k1", "ch_k3", "ch_k5", "ch_comb")
 BASE_FLAGS = ("ch_emb", "ch_addr", "ch_skel", "ch_rare", "ch_rev")
 
+# Pair channels produced by s3c_tfidf.py. flag = "this channel found the pair" (annotated on every row).
+# added_by (report only): 0 original, 1 F/G/H, 2 I, 3 J, 4 K.
+PAIR_CHANNELS = {
+    "I": dict(prefix="tfidf", s1="s1_id", cand="cand_id", score="tfidf_score", rank="tfidf_rank",
+              flag="ch_tfidf", rank_col="tfidf_rank", score_col="tfidf_score", order="rank", code=2),
+    "J": dict(prefix="tfidf_rev", s1="s1_id", cand="cand_id", score="score", rank="rank",
+              flag="ch_revtf", rank_col="revtf_rank", score_col=None, order="score", code=3),
+    "K": dict(prefix="tfidf_dict", s1="s1_id", cand="cand_id", score="score", rank="rank",
+              flag="ch_dict", rank_col=None, score_col=None, order="rank", code=4),
+}
+PAIR_MAX_NEW = 10
+
+
+def load_pair_channel(cache_dir: str, split: str, spec: dict) -> Optional[dict[str, np.ndarray]]:
+    """Loads {prefix}_{split}_source{2,3}.parquet as int64 (s1, cand) + score/rank arrays sorted by S1."""
+    s1s, cands, scores, ranks = [], [], [], []
+    for source in ("source2", "source3"):
+        p = os.path.join(cache_dir, f"{spec['prefix']}_{split}_{source}.parquet")
+        if not os.path.exists(p):
+            continue
+        t = pq.read_table(p, columns=[spec["s1"], spec["cand"], spec["score"], spec["rank"]])
+        s1s.append(_arrow_id_to_int(t[spec["s1"]]))
+        cands.append(_arrow_id_to_int(t[spec["cand"]]))
+        scores.append(t[spec["score"]].to_numpy().astype(np.float32))
+        ranks.append(t[spec["rank"]].to_numpy().astype(np.int8))
+        print(f"Loaded {spec['flag']} pairs from {p}: {t.num_rows:,} (RSS: {_rss_mb():.1f} MB)")
+        del t
+    if not s1s:
+        return None
+    s1 = np.concatenate(s1s)
+    order = np.argsort(s1, kind="stable")
+    return {"s1": s1[order], "cand": np.concatenate(cands)[order],
+            "score": np.concatenate(scores)[order], "rank": np.concatenate(ranks)[order]}
+
+
+def _pairs_for(pairs: dict, s1_int: np.ndarray) -> pd.DataFrame:
+    sel = _rows_for_s1(pairs["s1"], s1_int)
+    return pd.DataFrame({"s1": pairs["s1"][sel], "cand": pairs["cand"][sel],
+                         "score": pairs["score"][sel], "rank": pairs["rank"][sel]})
+
+
+def _new_row_value(col: str):
+    """Default for a column of a newly added pair row (flags 0, ranks 99, emb_rank 999, scores 0)."""
+    if col == "emb_rank":
+        return np.float32(999.0)
+    if col.endswith("_rank"):
+        return np.int8(TFIDF_RANK_MISSING)
+    return 0
+
+
+def add_pairs(df: pd.DataFrame, keys: pd.DataFrame, pairs: dict, spec: dict, emb_scorer, gt_pairs_int: set,
+              max_new: int = PAIR_MAX_NEW) -> tuple[pd.DataFrame, pd.DataFrame, int]:
+    """
+    Appends the channel's pairs that are not yet in df, at most max_new per S1
+    (order 'rank': lowest rank then highest score; 'score': highest score).
+    keys: DataFrame(s1, cand) aligned with df rows. Returns (df, keys, n_new).
+    """
+    T = _pairs_for(pairs, np.unique(keys["s1"].values))
+    m = T.merge(keys.assign(_in=True), on=["s1", "cand"], how="left")
+    new = m[m["_in"].isna()]
+    if spec["order"] == "rank":
+        new = new.sort_values(["s1", "rank", "score"], ascending=[True, True, False], kind="stable")
+    else:
+        new = new.sort_values(["s1", "score"], ascending=[True, False], kind="stable")
+    new = new.groupby("s1", sort=False).head(max_new)
+    if len(new) == 0:
+        return df, keys, 0
+    ns1 = new["s1"].values.astype(np.int64)
+    nc = new["cand"].values.astype(np.int64)
+    is_s2 = (nc // 1_000_000_000_000) == 2
+    cols: dict[str, Any] = {c: _new_row_value(c) for c in df.columns}
+    cols.update({
+        "s1_id": _int_to_id(ns1), "cand_id": _int_to_id(nc),
+        "cand_source": np.where(is_s2, 0, 1),
+        "emb_score": emb_scorer(ns1, nc, is_s2),
+        spec["flag"]: np.int8(1),
+        "added_by": np.int8(spec["code"]),
+    })
+    if spec["rank_col"]:
+        cols[spec["rank_col"]] = new["rank"].values.astype(np.int8)
+    if "label" in df.columns:
+        cols["label"] = np.fromiter(((int(x), int(y)) in gt_pairs_int for x, y in zip(ns1, nc)), dtype=bool, count=len(ns1))
+    new_df = pd.DataFrame({c: cols[c] for c in df.columns}, index=range(len(ns1)))
+    for c in df.columns:
+        new_df[c] = new_df[c].astype(df[c].dtype)
+    keys = pd.concat([keys, pd.DataFrame({"s1": ns1, "cand": nc})], ignore_index=True)
+    return pd.concat([df, new_df], ignore_index=True), keys, len(new_df)
+
+
+def annotate_pairs(df: pd.DataFrame, keys: pd.DataFrame, pairs: dict, spec: dict) -> int:
+    """Sets flag (and rank/score columns) on EVERY row from the channel's pairs; returns rows flagged."""
+    T = _pairs_for(pairs, np.unique(keys["s1"].values))
+    m = T.merge(keys.assign(row=np.arange(len(keys), dtype=np.int64)), on=["s1", "cand"], how="inner")
+    rows = m["row"].values
+    flag = np.zeros(len(df), dtype=np.int8)
+    flag[rows] = 1
+    df[spec["flag"]] = flag
+    if spec["rank_col"]:
+        rk = np.full(len(df), TFIDF_RANK_MISSING, dtype=np.int8)
+        rk[rows] = m["rank"].values
+        df[spec["rank_col"]] = rk
+    if spec["score_col"]:
+        sc = np.zeros(len(df), dtype=np.float32)
+        sc[rows] = m["score"].values
+        df[spec["score_col"]] = sc
+    return int(len(np.unique(rows)))
+
+
+def derive_added_by(df: pd.DataFrame) -> np.ndarray:
+    """added_by for rows of a chunk that has no added_by column yet (0 original, 1 F/G/H, 2 I-new)."""
+    n = len(df)
+    fgh = np.zeros(n, dtype=bool)
+    base = np.zeros(n, dtype=bool)
+    for c in FGH_FLAGS:
+        if c in df.columns:
+            fgh |= df[c].values > 0
+    for c in BASE_FLAGS:
+        if c in df.columns:
+            base |= df[c].values > 0
+    i_new = (df["ch_tfidf"].values > 0) & ~fgh & ~base if "ch_tfidf" in df.columns else np.zeros(n, dtype=bool)
+    return np.where(i_new, 2, np.where(fgh, 1, 0)).astype(np.int8)
+
 
 def _val_stage_rows(df: pd.DataFrame, val_s1: set) -> pd.DataFrame:
     """
@@ -217,6 +339,9 @@ def _val_stage_rows(df: pd.DataFrame, val_s1: set) -> pd.DataFrame:
       0 = original S3 row, 1 = added by F/G/H, 2 = added by Channel I (only ch_tfidf set).
     """
     d = df[df["s1_id"].isin(val_s1)]
+    if "added_by" in d.columns:
+        return pd.DataFrame({"s1": _id_to_int(d["s1_id"]), "cand": _id_to_int(d["cand_id"]),
+                             "stage": d["added_by"].values.astype(np.int8)})
     z = np.zeros(len(d), dtype=bool)
     fgh = np.zeros(len(d), dtype=bool)
     for c in FGH_FLAGS:
@@ -532,6 +657,7 @@ def run_augmentation(
     max_chunks: Optional[int] = None,
     batch_size: int = 5000,
     dry_run: bool = False,
+    disabled: Optional[set] = None,
 ) -> None:
     """Executes Stage 3b candidate augmentation chunk by chunk with minimal RSS."""
     total_start = time.time()
@@ -549,13 +675,25 @@ def run_augmentation(
     channel_h_any_active = channel_h_active_s2 or channel_h_active_s3
     tfidf = load_tfidf_pairs(cache_dir, split)
     channel_i_active = tfidf is not None
+    disabled = disabled or set()
+    pairs_j = None if "J" in disabled else load_pair_channel(cache_dir, split, PAIR_CHANNELS["J"])
+    pairs_k = None if "K" in disabled else load_pair_channel(cache_dir, split, PAIR_CHANNELS["K"])
+    if disabled:
+        print(f"Disabled pair channels: {sorted(disabled)}")
+    # Channel I pairs again in the generic layout (for tfidf_score / flag annotation of every row)
+    pairs_i = ({"s1": tfidf["s1"], "cand": tfidf["cand"], "score": tfidf["score"], "rank": tfidf["rank"]}
+               if channel_i_active else None)
     chunk_cols = {cf: set(pq.ParquetFile(cf).schema.names) for cf in chunk_files}
     need_fg = any("ch_rerank" not in c for c in chunk_cols.values())
     need_h = channel_h_any_active and any("ch_comb" not in c for c in chunk_cols.values())
     need_i = channel_i_active and any("ch_tfidf" not in c for c in chunk_cols.values())
+    need_j = pairs_j is not None and any("ch_revtf" not in c for c in chunk_cols.values())
+    need_k = pairs_k is not None and any("ch_dict" not in c for c in chunk_cols.values())
+    need_score = channel_i_active and any("tfidf_score" not in c for c in chunk_cols.values())
     need_heavy = need_fg or need_h
     print(f"Channels needed by some chunk: F/G={need_fg}, H={need_h} (active={channel_h_any_active}), "
-          f"I={need_i} (active={channel_i_active}) | dry_run={dry_run}")
+          f"I={need_i} (active={channel_i_active}), J={need_j} (active={pairs_j is not None}), "
+          f"K={need_k} (active={pairs_k is not None}), tfidf_score backfill={need_score} | dry_run={dry_run}")
 
     # 1. Load document frequencies
     doc_freqs = load_doc_freqs(cache_dir, split) if need_heavy else {}
@@ -729,14 +867,19 @@ def run_augmentation(
         run_fg = not has_rerank
         run_h = channel_h_any_active and (not has_comb)
         run_i = channel_i_active and (not has_tfidf)
+        run_j = pairs_j is not None and "ch_revtf" not in pf.schema.names
+        run_k = pairs_k is not None and "ch_dict" not in pf.schema.names
+        run_score = channel_i_active and "tfidf_score" not in pf.schema.names
         extra_cap = 30 if channel_h_any_active else 20
 
-        if not (run_fg or run_h or run_i):
-            print(f"  Nothing to do (ch_rerank={has_rerank}, ch_comb={has_comb}, ch_tfidf={has_tfidf}), skipping (idempotent).")
+        if not (run_fg or run_h or run_i or run_j or run_k or run_score):
+            print(f"  Nothing to do (ch_rerank={has_rerank}, ch_comb={has_comb}, ch_tfidf={has_tfidf}, "
+                  f"ch_revtf={not run_j}, ch_dict={not run_k}), skipping (idempotent).")
             if val_s1_set:
                 val_frames.append(_val_stage_rows(pd.read_parquet(chunk_path), val_s1_set))
             continue
-        print(f"  Channels to run: {'F+G ' if run_fg else ''}{'H ' if run_h else ''}{'I' if run_i else ''}", flush=True)
+        print(f"  Channels to run: {'F+G ' if run_fg else ''}{'H ' if run_h else ''}{'I ' if run_i else ''}"
+              f"{'J ' if run_j else ''}{'K ' if run_k else ''}{'(tfidf_score backfill)' if run_score else ''}", flush=True)
 
         chunk_df = pd.read_parquet(chunk_path)
         existing_rows_count = len(chunk_df)
@@ -1198,6 +1341,31 @@ def run_augmentation(
                   f"(avg +{n_i_new / max(1, len(chunk_s1_ints_unique)):.2f}/S1) in {time.time() - t_i0:.1f}s | "
                   f"RSS: {_rss_mb():.1f} MB", flush=True)
 
+        # CHANNELS J / K + annotation of every row (flags = "this channel found the pair")
+        n_jk_new = 0
+        if run_j or run_k or run_score or run_i:
+            t_a0 = time.time()
+            if "added_by" not in augmented_df.columns:
+                augmented_df["added_by"] = derive_added_by(augmented_df)
+            for col, val in (("tfidf_score", np.float32(0)), ("ch_revtf", np.int8(0)),
+                             ("revtf_rank", np.int8(TFIDF_RANK_MISSING)), ("ch_dict", np.int8(0))):
+                if col not in augmented_df.columns:
+                    augmented_df[col] = val
+            keys = pd.DataFrame({"s1": _id_to_int(augmented_df["s1_id"]), "cand": _id_to_int(augmented_df["cand_id"])})
+            for name, pairs, run in (("J", pairs_j, run_j), ("K", pairs_k, run_k)):
+                if run:
+                    augmented_df, keys, n_new = add_pairs(augmented_df, keys, pairs, PAIR_CHANNELS[name],
+                                                          _calc_emb_scores_batch, gt_pairs_int)
+                    n_jk_new += n_new
+                    print(f"  Channel {name}: added {n_new:,} new rows "
+                          f"(avg +{n_new / max(1, len(chunk_s1_ints_unique)):.2f}/S1) | RSS: {_rss_mb():.1f} MB", flush=True)
+            for name, pairs in (("I", pairs_i), ("J", pairs_j), ("K", pairs_k)):
+                if pairs is not None:
+                    n_flag = annotate_pairs(augmented_df, keys, pairs, PAIR_CHANNELS[name])
+                    print(f"  Annotated {PAIR_CHANNELS[name]['flag']}=1 on {n_flag:,} rows", flush=True)
+            del keys
+            print(f"  J/K + annotation done in {time.time() - t_a0:.1f}s | RSS: {_rss_mb():.1f} MB", flush=True)
+
         if val_s1_set:
             val_frames.append(_val_stage_rows(augmented_df, val_s1_set))
 
@@ -1209,7 +1377,7 @@ def run_augmentation(
             augmented_df.to_parquet(tmp_out, index=False)
             os.replace(tmp_out, chunk_path)
 
-        added_cnt = len(new_rows) + n_i_new
+        added_cnt = len(new_rows) + n_i_new + n_jk_new
         avg_extra = added_cnt / max(1, len(chunk_s1_ints_unique))
         t_ch_elapsed = time.time() - t_ch_start
         print(f"  Chunk {ch_idx + 1} {'Computed' if dry_run else 'Saved'}: {len(augmented_df):,} total rows "
@@ -1259,14 +1427,14 @@ def run_validation_report(
     if len(g) == 0:
         return
 
-    stages = [(0, "S3 original"), (1, "+ F/G/H"), (2, "+ Channel I")]
+    stages = [(0, "S3 original"), (1, "+ F/G/H"), (2, "+ Channel I"), (3, "+ Channel J"), (4, "+ Channel K")]
     groups = [("Overall", np.ones(len(g), dtype=bool))]
     countries = sorted(g["country"].unique())
     groups += [(f"  {c}", (g["country"] == c).values) for c in countries]
     groups += [(f"  {s}", (g["source"] == s).values) for s in ("S2", "S3")]
     groups += [(f"  {c} {s}", ((g["country"] == c) & (g["source"] == s)).values) for c in countries for s in ("S2", "S3")]
 
-    hdr = f"{'Pair recall':<18} | {'GT pairs':>9} | " + " | ".join(f"{n:>13}" for _, n in stages) + f" | {'Delta I':>8}"
+    hdr = f"{'Pair recall':<18} | {'GT pairs':>9} | " + " | ".join(f"{n:>13}" for _, n in stages) + f" | {'Delta J+K':>9}"
     print("-" * len(hdr))
     print(hdr)
     print("-" * len(hdr))
@@ -1276,14 +1444,14 @@ def run_validation_report(
         if n == 0:
             continue
         pct = [100.0 * int(((st <= s) & mask).sum()) / n for s, _ in stages]
-        print(f"{name:<18} | {n:>9,} | " + " | ".join(f"{p:>12.2f}%" for p in pct) + f" | {pct[2] - pct[1]:>+7.2f}%")
+        print(f"{name:<18} | {n:>9,} | " + " | ".join(f"{p:>12.2f}%" for p in pct) + f" | {pct[4] - pct[2]:>+8.2f}%")
     print("-" * len(hdr))
     ent_stage = g.groupby("s1")["stage"].max().values
     ent = [100.0 * (ent_stage <= s).mean() for s, _ in stages]
-    print(f"{'Entity recall':<18} | {len(ent_stage):>9,} | " + " | ".join(f"{p:>12.2f}%" for p in ent) + f" | {ent[2] - ent[1]:>+7.2f}%")
+    print(f"{'Entity recall':<18} | {len(ent_stage):>9,} | " + " | ".join(f"{p:>12.2f}%" for p in ent) + f" | {ent[4] - ent[2]:>+8.2f}%")
     fst = first["stage"].values
     cps = [int((fst <= s).sum()) / max(1, n_val_s1) for s, _ in stages]
-    print(f"{'Cands per S1':<18} | {'':>9} | " + " | ".join(f"{c:>13.1f}" for c in cps) + f" | {cps[2] - cps[1]:>+8.1f}")
+    print(f"{'Cands per S1':<18} | {'':>9} | " + " | ".join(f"{c:>13.1f}" for c in cps) + f" | {cps[4] - cps[2]:>+9.1f}")
     print("=" * 100 + "\n")
 
 
@@ -1294,6 +1462,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--laptop-test", action="store_true", help="Use cache/laptop_test.")
     parser.add_argument("--max-chunks", type=int, default=None, help="Maximum number of chunks to process.")
     parser.add_argument("--batch-size", type=int, default=5000, help="Batch size for GPU operations.")
+    parser.add_argument("--disable-channels", default="",
+                        help="Comma list of pair channels to ignore even if their files exist, e.g. K")
     parser.add_argument("--dry-run", action="store_true",
                         help="Compute everything and print the recall report, but write no chunk files.")
     return parser.parse_args()
@@ -1318,6 +1488,7 @@ def main() -> None:
         max_chunks=args.max_chunks,
         batch_size=args.batch_size,
         dry_run=args.dry_run,
+        disabled={c.strip().upper() for c in args.disable_channels.split(",") if c.strip()},
     )
 
 

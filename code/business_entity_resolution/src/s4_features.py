@@ -339,6 +339,62 @@ def load_candidate_embeddings(cache_dir, split, needed_cand_ids=None):
     return all_cand_emb, id_to_row
 
 
+class CombEmbeddings:
+    """
+    Combined name+address embeddings (cache/embc_{split}_source{1,2,3}.npy, L2-normalised float16) kept
+    memory-mapped; one sorted int64 ID index over all sources. cos() gathers only the rows a batch needs.
+    """
+
+    def __init__(self, cache_dir: str, split: str):
+        ids_all, src_all, row_all = [], [], []
+        self.mmaps = []
+        for si, src in enumerate(("source1", "source2", "source3")):
+            ep = os.path.join(cache_dir, f"embc_{split}_{src}.npy")
+            ip = os.path.join(cache_dir, f"idsc_{split}_{src}.npy")
+            if not (os.path.exists(ep) and os.path.exists(ip)):
+                raise FileNotFoundError(f"combined embeddings missing: {ep} / {ip}")
+            self.mmaps.append(np.load(ep, mmap_mode="r"))
+            raw = pa.array(np.load(ip, allow_pickle=True).tolist(), type=pa.string())
+            ids_all.append(_arrow_ids_to_int(raw))
+            src_all.append(np.full(len(raw), si, dtype=np.int8))
+            row_all.append(np.arange(len(raw), dtype=np.int64))
+        ids = np.concatenate(ids_all)
+        order = np.argsort(ids, kind="stable")
+        self.ids = ids[order]
+        self.src = np.concatenate(src_all)[order]
+        self.row = np.concatenate(row_all)[order]
+
+    def _vecs(self, ids_int: np.ndarray):
+        pos = np.clip(np.searchsorted(self.ids, ids_int), 0, len(self.ids) - 1)
+        ok = self.ids[pos] == ids_int
+        out = np.zeros((len(ids_int), self.mmaps[0].shape[1]), dtype=np.float32)
+        for si, mm in enumerate(self.mmaps):
+            sel = np.flatnonzero(ok & (self.src[pos] == si))
+            if len(sel):
+                uniq, inv = np.unique(self.row[pos[sel]], return_inverse=True)
+                out[sel] = np.asarray(mm[uniq], dtype=np.float32)[inv]
+        return out, ok
+
+    def cos(self, s1_int: np.ndarray, cand_int: np.ndarray, block: int = 200_000) -> np.ndarray:
+        """Dot product of the stored combined embeddings per pair; NaN if either side has none."""
+        res = np.full(len(s1_int), np.nan, dtype=np.float32)
+        for b in range(0, len(s1_int), block):
+            a, oka = self._vecs(s1_int[b:b + block])
+            c, okc = self._vecs(cand_int[b:b + block])
+            d = np.einsum("ij,ij->i", a, c).astype(np.float32)
+            d[~(oka & okc)] = np.nan
+            res[b:b + block] = d
+        return res
+
+
+def _arrow_ids_to_int(col) -> np.ndarray:
+    """'S2-12345' strings (arrow) -> int64 source_digit * 10^12 + number (same encoding as _id_to_int)."""
+    import pyarrow.compute as pc
+    digit = pc.cast(pc.utf8_slice_codeunits(col, 1, 2), "int64")
+    num = pc.cast(pc.utf8_slice_codeunits(col, 3), "int64")
+    return pc.add(pc.multiply(digit, 1_000_000_000_000), num).to_numpy()
+
+
 def compute_support_feature(chunk_df, all_cand_emb, id_to_row):
     """
     Computes max cosine similarity to other top-5 candidates (by emb_score) for each S1.
@@ -419,7 +475,7 @@ def compute_context_features(context_df, all_cand_emb, cand_id_map):
 
 def compute_chunk_features(chunk_df, s1_df, cands_df, all_cand_emb, cand_id_map,
                            global_reverse_rank, df_tokens,
-                           ctx_gap_to_best, ctx_n_cands, ctx_support):
+                           ctx_gap_to_best, ctx_n_cands, ctx_support, comb=None):
     """
     Extracts all 31 features and rule_score for a candidate chunk without row-wise loops.
     Token sets and lengths are computed locally only for rows in this chunk.
@@ -571,8 +627,18 @@ def compute_chunk_features(chunk_df, s1_df, cands_df, all_cand_emb, cand_id_map,
     ch_comb = chunk_df.get('ch_comb', pd.Series(0, index=chunk_df.index)).values.astype(np.float32)
     ch_tfidf = chunk_df.get('ch_tfidf', pd.Series(0, index=chunk_df.index)).values.astype(np.float32)
     tfidf_rank = chunk_df.get('tfidf_rank', pd.Series(99, index=chunk_df.index)).values.astype(np.float32)
+    tfidf_score = chunk_df.get('tfidf_score', pd.Series(0, index=chunk_df.index)).values.astype(np.float32)
+    ch_revtf = chunk_df.get('ch_revtf', pd.Series(0, index=chunk_df.index)).values.astype(np.float32)
+    revtf_rank = chunk_df.get('revtf_rank', pd.Series(99, index=chunk_df.index)).values.astype(np.float32)
+    ch_dict = chunk_df.get('ch_dict', pd.Series(0, index=chunk_df.index)).values.astype(np.float32)
     n_channels = (ch_emb + ch_addr + ch_skel + ch_rare + ch_rev + ch_rerank + ch_k1 + ch_k3 + ch_k5 + ch_comb
-                  + ch_tfidf).astype(np.float32)
+                  + ch_tfidf + ch_revtf + ch_dict).astype(np.float32)
+    # comb_cos: dot of the stored combined name+address embeddings (NaN when unavailable)
+    if comb is not None:
+        comb_cos = comb.cos(_arrow_ids_to_int(pa.array(s1_ids, type=pa.string())),
+                            _arrow_ids_to_int(pa.array(cand_ids, type=pa.string())))
+    else:
+        comb_cos = np.full(n_pairs, np.nan, dtype=np.float32)
 
     # 14. Per-S1 context features: precomputed on FULL candidate list per S1
     gap_to_best = ctx_gap_to_best
@@ -615,7 +681,8 @@ def compute_chunk_features(chunk_df, s1_df, cands_df, all_cand_emb, cand_id_map,
         'state_match': state_match, 'addr_missing_any': addr_missing_any, 'cand_source': cand_source,
         'ch_emb': ch_emb, 'ch_addr': ch_addr, 'ch_skel': ch_skel, 'ch_rare': ch_rare, 'ch_rev': ch_rev,
         'ch_rerank': ch_rerank, 'ch_keyx': ch_keyx, 'ch_comb': ch_comb,
-        'ch_tfidf': ch_tfidf, 'tfidf_rank': tfidf_rank,
+        'ch_tfidf': ch_tfidf, 'tfidf_rank': tfidf_rank, 'tfidf_score': tfidf_score,
+        'ch_revtf': ch_revtf, 'revtf_rank': revtf_rank, 'ch_dict': ch_dict, 'comb_cos': comb_cos,
         'n_channels': n_channels, 'gap_to_best': gap_to_best, 'n_cands': n_cands,
         'reverse_rank': reverse_rank, 'support': support
     }
@@ -1031,6 +1098,16 @@ def main():
     print(f"Candidate embeddings ready: {len(all_cand_emb):,} vectors in {time.time() - t_emb:.2f}s "
           f"(RSS {_rss_mb():.0f} MB)", flush=True)
 
+    # 7b. Combined embeddings for comb_cos (memory-mapped; only the ID index is held in RAM)
+    t_comb = time.time()
+    try:
+        comb = CombEmbeddings(cache_dir, args.split)
+        print(f"Combined embeddings index ready: {len(comb.ids):,} IDs in {time.time() - t_comb:.1f}s "
+              f"(RSS {_rss_mb():.0f} MB)", flush=True)
+    except FileNotFoundError as e:
+        comb = None
+        print(f"WARNING: {e}; comb_cos will be NaN", flush=True)
+
     # Baseline memory breakdown
     s1_mem = s1_norm.memory_usage(deep=True).sum() / 1_048_576
     cands_mem = cands_norm.memory_usage(deep=True).sum() / 1_048_576
@@ -1121,7 +1198,7 @@ def main():
                 feats_df = compute_chunk_features(
                     kept_df, s1_norm, cands_norm, all_cand_emb, cand_id_map,
                     ctx_rr[rows][sub_keep], df_tokens,
-                    ctx_gap[sub_keep], ctx_nc[sub_keep], ctx_sup[sub_keep]
+                    ctx_gap[sub_keep], ctx_nc[sub_keep], ctx_sup[sub_keep], comb=comb
                 )
                 part_tables.append(pa.Table.from_pandas(feats_df, preserve_index=False))
                 part_pos.append(kept_pos[rows][sub_keep])

@@ -72,6 +72,11 @@ FEATURES = [
     "ch_comb",
     "ch_tfidf",
     "tfidf_rank",
+    "tfidf_score",
+    "ch_revtf",
+    "revtf_rank",
+    "ch_dict",
+    "comb_cos",
     "n_channels",
     # Context Features
     "gap_to_best",
