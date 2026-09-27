@@ -9,6 +9,20 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from rapidfuzz import process, fuzz
+from rapidfuzz.distance import JaroWinkler, Levenshtein, LCSseq
+
+_NON_ALNUM = re.compile(r"[\W_]+")
+_LONGNUM = re.compile(r"\d{5,}")
+
+
+def _initials(core: str) -> str:
+    return "".join(t[0] for t in core.split() if t)
+
+
+def _acronym_match(a: str, b: str) -> bool:
+    """True if the initials of one core_name (>= 2 tokens) equal the other core_name with spaces removed."""
+    ia, ib = _initials(a), _initials(b)
+    return (len(ia) >= 2 and ia == b.replace(" ", "")) or (len(ib) >= 2 and ib == a.replace(" ", ""))
 
 import config
 
@@ -646,11 +660,34 @@ def compute_chunk_features(chunk_df, s1_df, cands_df, all_cand_emb, cand_id_map,
 
     # 11b. name_freq: log1p(#records of the split sharing (country, core_name)), for S1 and candidate
     if name_freq is not None:
-        s1_name_freq = name_freq.log_freq(s1_sub['country'].astype(str).values, s1_sub['core_name'].values)
-        cand_name_freq = name_freq.log_freq(cand_sub['country'].astype(str).values, cand_sub['core_name'].values)
+        name_freq_s1 = name_freq.log_freq(s1_sub['country'].astype(str).values, s1_sub['core_name'].values)
+        name_freq_cand = name_freq.log_freq(cand_sub['country'].astype(str).values, cand_sub['core_name'].values)
     else:
-        s1_name_freq = np.full(n_pairs, np.nan, dtype=np.float32)
-        cand_name_freq = np.full(n_pairs, np.nan, dtype=np.float32)
+        name_freq_s1 = np.full(n_pairs, np.nan, dtype=np.float32)
+        name_freq_cand = np.full(n_pairs, np.nan, dtype=np.float32)
+
+    # 11d. core_name string similarities (0..1 normalised for JW / Levenshtein / LCSseq, 0..100 for ratio)
+    s1_cn_s = [str(x) for x in s1_cn]
+    c_cn_s = [str(x) for x in c_cn]
+    jw_core = process.cpdist(s1_cn_s, c_cn_s, scorer=JaroWinkler.normalized_similarity, workers=-1).astype(np.float32)
+    lev_core = process.cpdist(s1_cn_s, c_cn_s, scorer=Levenshtein.normalized_similarity, workers=-1).astype(np.float32)
+    lcs_core = process.cpdist(s1_cn_s, c_cn_s, scorer=LCSseq.normalized_similarity, workers=-1).astype(np.float32)
+    s1_cmp = {eid: _NON_ALNUM.sub("", str(x)) for eid, x in zip(chunk_s1_unique, s1_df.loc[chunk_s1_unique, 'core_name'])}
+    c_cmp = {cid: _NON_ALNUM.sub("", str(x)) for cid, x in zip(chunk_c_unique, cands_df.loc[chunk_c_unique, 'core_name'])}
+    compact_ratio = process.cpdist([s1_cmp[e] for e in s1_ids], [c_cmp[c] for c in cand_ids],
+                                   scorer=fuzz.ratio, workers=-1).astype(np.float32)
+    del s1_cmp, c_cmp
+    initials_match = np.fromiter((_acronym_match(a, b) for a, b in zip(s1_cn_s, c_cn_s)), dtype=np.float32, count=n_pairs)
+    first_tok_match = np.fromiter(((a.split()[:1] == b.split()[:1]) and bool(a.split()) for a, b in zip(s1_cn_s, c_cn_s)),
+                                  dtype=np.float32, count=n_pairs)
+    del s1_cn_s, c_cn_s
+
+    # 11e. longnum_match: both addresses share a digit run of length >= 5 (1), none shared (0), either has none (-1)
+    s1_ln = {eid: frozenset(_LONGNUM.findall(str(x))) for eid, x in zip(chunk_s1_unique, s1_df.loc[chunk_s1_unique, 'addr_norm'])}
+    c_ln = {cid: frozenset(_LONGNUM.findall(str(x))) for cid, x in zip(chunk_c_unique, cands_df.loc[chunk_c_unique, 'addr_norm'])}
+    longnum_match = np.fromiter(((-1.0 if not (a := s1_ln[e]) or not (b := c_ln[c]) else float(bool(a & b)))
+                                 for e, c in zip(s1_ids, cand_ids)), dtype=np.float32, count=n_pairs)
+    del s1_ln, c_ln
 
     # 11c. dict_name_ratio: token_sort_ratio(S1 name_full, candidate name_full after the Channel K token map)
     if name_map:
@@ -738,7 +775,9 @@ def compute_chunk_features(chunk_df, s1_df, cands_df, all_cand_emb, cand_id_map,
         'ch_rerank': ch_rerank, 'ch_keyx': ch_keyx, 'ch_comb': ch_comb,
         'ch_tfidf': ch_tfidf, 'tfidf_rank': tfidf_rank, 'tfidf_score': tfidf_score,
         'ch_revtf': ch_revtf, 'revtf_rank': revtf_rank, 'ch_dict': ch_dict, 'comb_cos': comb_cos,
-        's1_name_freq': s1_name_freq, 'cand_name_freq': cand_name_freq, 'dict_name_ratio': dict_name_ratio,
+        'name_freq_s1': name_freq_s1, 'name_freq_cand': name_freq_cand, 'dict_name_ratio': dict_name_ratio,
+        'jw_core': jw_core, 'lev_core': lev_core, 'lcs_core': lcs_core, 'compact_ratio': compact_ratio,
+        'initials_match': initials_match, 'first_tok_match': first_tok_match, 'longnum_match': longnum_match,
         'n_channels': n_channels, 'gap_to_best': gap_to_best, 'n_cands': n_cands,
         'reverse_rank': reverse_rank, 'support': support
     }
