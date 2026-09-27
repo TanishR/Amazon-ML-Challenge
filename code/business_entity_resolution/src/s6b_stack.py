@@ -69,7 +69,7 @@ def load_meta(cache_dir, split, cand_ids):
     return name, addr, house, nums
 
 
-def build_features(df: pd.DataFrame, meta):
+def build_features(df: pd.DataFrame, meta, ce=None):
     """
     df: s1_id, cand_id (int64), prob, emb_score [+ is_competitor]. Competition features use ALL rows of df.
     Returns (sub, X) for rows with prob >= MIN_PROB, sub sorted by S1, prob desc, emb_score desc, cand_id.
@@ -139,7 +139,12 @@ def build_features(df: pd.DataFrame, meta):
         F["other_gt_03"][i] = cnt - 1 if p > 0.30 else cnt
         F["best_competing_prob"][i] = top2_p.get(c, 0.0) if top1_s1.get(c, -1) == s else top1_p.get(c, 0.0)
     F["prob_minus_comp"] = pv - F["best_competing_prob"]
-    return sub, np.column_stack([F[f] for f in FEATS]).astype(np.float32)
+    X = np.column_stack([F[f] for f in FEATS]).astype(np.float32)
+    if ce is not None:
+        # ce_prob: cross-encoder probability (-1 where the pair was not scored)
+        m = sub[["s1_id", "cand_id"]].merge(ce[["s1_id", "cand_id", "ce_prob"]], on=["s1_id", "cand_id"], how="left")
+        X = np.column_stack([X, m["ce_prob"].fillna(-1.0).values.astype(np.float32)])
+    return sub, X
 
 
 def stage6_f05(log_path):
@@ -158,8 +163,12 @@ def cmd_val(a):
     probs = pd.read_parquet(a.val_probs)
     print(f"val_probs: {len(probs):,} rows (competitor {int((probs.is_competitor == 1).sum()):,}) | RSS {rss_gb():.2f} GB", flush=True)
     meta = load_meta(a.cache_dir, "train", probs.loc[probs.prob >= MIN_PROB, "cand_id"].unique())
-    sub, X = build_features(probs, meta)
-    del meta
+    ce = pd.read_parquet(a.ce_scores) if a.ce_scores else None
+    feats = FEATS + (["ce_prob"] if ce is not None else [])
+    sub, X = build_features(probs, meta, ce)
+    del meta, ce
+    if a.ce_scores:
+        print(f"ce_prob coverage on stacked rows: {100 * (X[:, -1] >= 0).mean():.2f}%", flush=True)
     gt = pd.read_parquet(os.path.join(a.cache_dir, "gt_long.parquet"))
     gt_set = set(zip(_id_to_int(gt.s1_id, validate=False).values, _id_to_int(gt.match_id, validate=False).values))
     gold = build_gold_map(gt, val_s1)
@@ -182,7 +191,7 @@ def cmd_val(a):
     comp = ~is_val
     stacked[comp] = 0.5 * (m0.predict_proba(X[comp])[:, 1] + m1.predict_proba(X[comp])[:, 1])
     imp = (m0.feature_importances_ + m1.feature_importances_) / 2
-    print("stacker importance:", ", ".join(f"{f} {v:.0f}" for f, v in sorted(zip(FEATS, imp), key=lambda x: -x[1])[:8]), flush=True)
+    print("stacker importance (split count):", ", ".join(f"{f} {v:.0f}" for f, v in sorted(zip(feats, imp), key=lambda x: -x[1])), flush=True)
 
     val_s1_int = _id_to_int(pd.Series(val_s1), validate=True).tolist()
     gold_int = {si: (set(_id_to_int(pd.Series(list(gold[ss])), validate=True).tolist()) if gold[ss] else set())
@@ -217,7 +226,11 @@ def cmd_test(a):
     probs = pd.read_parquet(a.test_probs)
     print(f"test_probs: {len(probs):,} rows over {probs.s1_id.nunique():,} S1 | RSS {rss_gb():.2f} GB", flush=True)
     meta = load_meta(a.cache_dir, "test", probs.loc[probs.prob >= MIN_PROB, "cand_id"].unique())
-    sub, X = build_features(probs, meta)
+    ce = pd.read_parquet(a.ce_scores) if a.ce_scores else None
+    sub, X = build_features(probs, meta, ce)
+    if ce is not None:
+        print(f"ce_prob coverage on stacked test rows: {100 * (X[:, -1] >= 0).mean():.2f}%", flush=True)
+    del ce
     del meta, probs
     sub["prob"] = booster.predict(X).astype(np.float32)
     sub["is_competitor"] = np.int8(0)
@@ -239,6 +252,7 @@ def main():
     p.add_argument("--test-probs", default=os.path.join(config.CACHE_DIR, "test_probs.parquet"))
     p.add_argument("--stage6-log", default=os.path.join(os.path.dirname(config.CACHE_DIR), "logs", "stage_6.log"))
     p.add_argument("--out-dir", default=os.path.join(config.CACHE_DIR, "stack"))
+    p.add_argument("--ce-scores", default=None, help="optional ce_scores_{val,test}.parquet -> extra stacker feature ce_prob")
     a = p.parse_args()
     {"val": cmd_val, "test": cmd_test}[a.cmd](a)
 
