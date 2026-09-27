@@ -38,7 +38,6 @@ T_EXTRA = 0.68
 EXCL_MARGIN = 0.05
 FEATURES = [
     # Embedding & Rank
-    "emb_score",
     "emb_rank",
     # Name Similarity
     "name_token_sort",
@@ -72,11 +71,9 @@ FEATURES = [
     "ch_comb",
     "ch_tfidf",
     "tfidf_rank",
-    "tfidf_score",
     "ch_revtf",
     "revtf_rank",
     "ch_dict",
-    "comb_cos",
     "name_freq_s1",
     "name_freq_cand",
     "dict_name_ratio",
@@ -87,12 +84,18 @@ FEATURES = [
     "initials_match",
     "first_tok_match",
     "longnum_match",
+    # Feature pack 2: scores relative to the S1's own candidate list (replace absolute emb/comb/tfidf/support)
+    "emb_score_rel", "emb_score_z", "emb_score_rk",
+    "comb_cos_rel", "comb_cos_z", "comb_cos_rk",
+    "tfidf_score_rel", "tfidf_score_z", "tfidf_score_rk",
+    "support_rel", "support_z", "support_rk",
+    "a_freq_s1", "a_freq_cand", "k_freq_s1", "k_freq_cand",
+    "k_eq", "k_ratio", "legal_conflict",
     "n_channels",
     # Context Features
     "gap_to_best",
     "n_cands",
     "reverse_rank",
-    "support",
 ]
 
 def load_tsv(path):

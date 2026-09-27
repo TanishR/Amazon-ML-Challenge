@@ -15,6 +15,128 @@ _NON_ALNUM = re.compile(r"[\W_]+")
 _LONGNUM = re.compile(r"\d{5,}")
 
 
+_STREET_ABBR = {"rue": "r", "boulevard": "bd", "blvd": "bd", "avenue": "av", "ave": "av", "road": "rd",
+                "street": "st", "place": "pl", "chemin": "ch", "route": "rte"}
+_PUNCT = re.compile(r"[^\w]+", re.UNICODE)
+
+
+def street_key(raw_address) -> str:
+    """
+    Street key: the first comma-separated segment of the raw address with a number followed by a word,
+    lower-cased, punctuation -> space, leading zeros stripped from numbers, common street words shortened.
+    Segments made of numbers only (postal codes) are skipped. '' if none.
+    """
+    if not isinstance(raw_address, str) or not raw_address:
+        return ""
+    for seg in raw_address.split(","):
+        toks = _PUNCT.sub(" ", seg.lower()).split()
+        if not toks or all(t.isdigit() for t in toks):
+            continue
+        if not any(any(ch.isdigit() for ch in t) and toks[i + 1].isalpha() for i, t in enumerate(toks[:-1])):
+            continue
+        out = []
+        for t in toks:
+            if t.isdigit():
+                t = t.lstrip("0") or "0"
+            out.append(_STREET_ABBR.get(t, t))
+        return " ".join(out)
+    return ""
+
+
+def _legal_forms():
+    from maps import LEGAL_SUFFIXES, NAME_ABBREVIATIONS
+    extra = {"ei", "eirl", "scop", "sca", "scs", "sel", "selarl", "selas", "gie", "gmbh", "plc"}
+    return set(LEGAL_SUFFIXES) | extra, dict(NAME_ABBREVIATIONS)
+
+
+_LEGAL_SET, _NAME_ABBR = _legal_forms()
+
+
+def legal_forms(raw_name, legal) -> str:
+    """Sorted legal-form tokens: normalised 'legal' plus forms found in raw_name with dots removed (S.A.R.L. -> sarl)."""
+    forms = set(str(legal).split()) if isinstance(legal, str) and legal.strip() else set()
+    if isinstance(raw_name, str) and raw_name:
+        for t in _PUNCT.sub(" ", raw_name.lower().replace(".", "")).split():
+            t = _NAME_ABBR.get(t, t)
+            for tt in t.split():
+                if tt in _LEGAL_SET:
+                    forms.add(tt)
+    return " ".join(sorted(forms))
+
+
+def add_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """street_key from raw_address and legal2 from raw_name (+ legal); drops the raw columns."""
+    if "raw_address" in df.columns:
+        df["street_key"] = [street_key(x) for x in df["raw_address"].values]
+        df = df.drop(columns=["raw_address"])
+    if "raw_name" in df.columns:
+        df["legal2"] = [legal_forms(r, l) for r, l in zip(df["raw_name"].values,
+                                                           df["legal"].astype(str).values if "legal" in df.columns else [""] * len(df))]
+        df = df.drop(columns=["raw_name"])
+    return df
+
+
+class KeyFreq:
+    """
+    log1p count of records sharing (country, key) within one split, over the given sources. key is a norm-table
+    column ('addr_norm') or 'street_key' (derived from raw_address). Empty keys count 0.
+    """
+
+    def __init__(self, cache_dir: str, split: str, sources, key: str):
+        self.key = key
+        hashes = []
+        col = "raw_address" if key == "street_key" else key
+        for src in sources:
+            pf = pq.ParquetFile(os.path.join(cache_dir, f"norm_{split}_{src}.parquet"))
+            for rg in range(pf.num_row_groups):
+                t = pf.read_row_group(rg, columns=["country", col]).to_pandas()
+                vals = [street_key(x) for x in t[col].values] if key == "street_key" else t[col].fillna("").astype(str).values
+                vals = np.asarray(vals, dtype=object)
+                ok = vals != ""
+                if ok.any():
+                    hashes.append(NameFreq._hash(t["country"].values[ok], vals[ok]))
+                del t
+        self.keys, self.counts = np.unique(np.concatenate(hashes), return_counts=True)
+
+    def log_freq(self, country, vals) -> np.ndarray:
+        vals = np.asarray(pd.Series(vals).fillna("").astype(str).values, dtype=object)
+        h = NameFreq._hash(country, vals)
+        pos = np.clip(np.searchsorted(self.keys, h), 0, len(self.keys) - 1)
+        cnt = np.where((self.keys[pos] == h) & (vals != ""), self.counts[pos], 0)
+        return np.log1p(cnt).astype(np.float32)
+
+
+def relative_features(ctx_df: pd.DataFrame, ctx_support: np.ndarray, comb=None) -> dict:
+    """
+    Per-S1 relative versions of absolute scores over the S1's FULL candidate list (context rows):
+    x_rel = x / max over the list (0 if max <= 0), x_z = z-score within the list (0 if std 0), x_rk = rank desc.
+    """
+    s1 = ctx_df["s1_id"].values
+    cols = {
+        "emb_score": ctx_df["emb_score"].values.astype(np.float32),
+        "tfidf_score": (ctx_df["tfidf_score"].values if "tfidf_score" in ctx_df.columns
+                        else np.zeros(len(ctx_df))).astype(np.float32),
+        "support": np.asarray(ctx_support, dtype=np.float32),
+    }
+    if comb is not None:
+        cc = comb.cos(_arrow_ids_to_int(pa.array(s1, type=pa.string())),
+                      _arrow_ids_to_int(pa.array(ctx_df["cand_id"].values, type=pa.string())))
+        cols["comb_cos"] = np.nan_to_num(cc, nan=0.0).astype(np.float32)
+    else:
+        cols["comb_cos"] = np.zeros(len(ctx_df), dtype=np.float32)
+    codes = pd.factorize(s1)[0]
+    out = {}
+    for name, v in cols.items():
+        g = pd.Series(v).groupby(codes)
+        mx = g.transform("max").values
+        mu = g.transform("mean").values
+        sd = g.transform("std", ddof=0).values
+        out[f"{name}_rel"] = np.where(mx > 0, v / np.where(mx > 0, mx, 1), 0).astype(np.float32)
+        out[f"{name}_z"] = np.where(sd > 1e-9, (v - mu) / np.where(sd > 1e-9, sd, 1), 0).astype(np.float32)
+        out[f"{name}_rk"] = g.rank(method="min", ascending=False).values.astype(np.float32)
+    return out
+
+
 def _initials(core: str) -> str:
     return "".join(t[0] for t in core.split() if t)
 
@@ -260,7 +382,7 @@ def extract_rare3_set(addr, country, df_tokens):
 NEEDED_NORM_COLS = [
     'entity_id', 'country', 'name_full', 'core_name', 'name_skel',
     'addr_norm', 'legal', 'name_a', 'name_b', 'name_aka_a', 'name_aka_b',
-    'house_no', 'zip_pin', 'state_code', 'num_tokens', 'house_cands'
+    'house_no', 'zip_pin', 'state_code', 'num_tokens', 'house_cands', 'raw_name', 'raw_address'
 ]
 
 
@@ -286,6 +408,7 @@ def load_norm_table(cache_dir, split, source, needed_ids=None, columns=None):
             df = pd.read_parquet(p, columns=cols_to_read)
             if needed_ids is not None:
                 df = df[df["entity_id"].isin(needed_ids)]
+            df = add_derived_columns(df)
             for cat_col in ['country', 'legal', 'state_code']:
                 if cat_col in df.columns:
                     df[cat_col] = df[cat_col].astype('category')
@@ -525,7 +648,8 @@ def compute_context_features(context_df, all_cand_emb, cand_id_map):
 
 def compute_chunk_features(chunk_df, s1_df, cands_df, all_cand_emb, cand_id_map,
                            global_reverse_rank, df_tokens,
-                           ctx_gap_to_best, ctx_n_cands, ctx_support, comb=None, name_freq=None, name_map=None):
+                           ctx_gap_to_best, ctx_n_cands, ctx_support, comb=None, name_freq=None, name_map=None,
+                           rel=None, key_freqs=None):
     """
     Extracts all 31 features and rule_score for a candidate chunk without row-wise loops.
     Token sets and lengths are computed locally only for rows in this chunk.
@@ -700,6 +824,27 @@ def compute_chunk_features(chunk_df, s1_df, cands_df, all_cand_emb, cand_id_map,
     dict_name_ratio = process.cpdist(s1_nf, c_dict_names, scorer=fuzz.token_sort_ratio, workers=-1).astype(np.float32)
     del c_dict_names
 
+    # 11f. Feature pack 2: street key equality/ratio, legal-form conflict, address / street-key frequencies
+    s1_k = s1_sub['street_key'].values if 'street_key' in s1_sub.columns else np.full(n_pairs, "", dtype=object)
+    c_k = cand_sub['street_key'].values if 'street_key' in cand_sub.columns else np.full(n_pairs, "", dtype=object)
+    k_missing = (s1_k == "") | (c_k == "")
+    k_eq = np.where(k_missing, -1, (s1_k == c_k).astype(np.int8)).astype(np.float32)
+    k_ratio = process.cpdist(list(s1_k), list(c_k), scorer=fuzz.ratio, workers=-1).astype(np.float32)
+    k_ratio[k_missing] = -1.0
+    s1_lg = s1_sub['legal2'].values if 'legal2' in s1_sub.columns else np.full(n_pairs, "", dtype=object)
+    c_lg = cand_sub['legal2'].values if 'legal2' in cand_sub.columns else np.full(n_pairs, "", dtype=object)
+    legal_conflict = np.fromiter(((-1.0 if not a or not b else (0.0 if set(a.split()) & set(b.split()) else 1.0))
+                                  for a, b in zip(s1_lg, c_lg)), dtype=np.float32, count=n_pairs)
+    if key_freqs:
+        s1_ctry = s1_sub['country'].astype(str).values
+        c_ctry = cand_sub['country'].astype(str).values
+        a_freq_s1 = key_freqs["a_s1"].log_freq(s1_ctry, s1_sub['addr_norm'].values)
+        a_freq_cand = key_freqs["a_pool"].log_freq(c_ctry, cand_sub['addr_norm'].values)
+        k_freq_s1 = key_freqs["k_s1"].log_freq(s1_ctry, s1_k)
+        k_freq_cand = key_freqs["k_pool"].log_freq(c_ctry, c_k)
+    else:
+        a_freq_s1 = a_freq_cand = k_freq_s1 = k_freq_cand = np.zeros(n_pairs, dtype=np.float32)
+
     # 12. addr_missing_any: 1 if address empty on either side, else 0
     addr_missing_any = ((np.array(s1_ad) == '') | (np.array(c_ad) == '')).astype(np.float32)
     del s1_nf, c_nf, s1_cn, c_cn, s1_sk, c_sk, s1_ad, c_ad, s1_sub, cand_sub
@@ -777,11 +922,17 @@ def compute_chunk_features(chunk_df, s1_df, cands_df, all_cand_emb, cand_id_map,
         'ch_revtf': ch_revtf, 'revtf_rank': revtf_rank, 'ch_dict': ch_dict, 'comb_cos': comb_cos,
         'name_freq_s1': name_freq_s1, 'name_freq_cand': name_freq_cand, 'dict_name_ratio': dict_name_ratio,
         'jw_core': jw_core, 'lev_core': lev_core, 'lcs_core': lcs_core, 'compact_ratio': compact_ratio,
+        'k_eq': k_eq, 'k_ratio': k_ratio, 'legal_conflict': legal_conflict,
+        'a_freq_s1': a_freq_s1, 'a_freq_cand': a_freq_cand, 'k_freq_s1': k_freq_s1, 'k_freq_cand': k_freq_cand,
         'initials_match': initials_match, 'first_tok_match': first_tok_match, 'longnum_match': longnum_match,
         'n_channels': n_channels, 'gap_to_best': gap_to_best, 'n_cands': n_cands,
         'reverse_rank': reverse_rank, 'support': support
     }
 
+    if rel:
+        computed_map.update(rel)
+    # raw emb_score is kept as a column (decision-layer tie-breaks in s6/s7) even when it is not a model feature
+    feats_dict['emb_score'] = emb_score
     for col in config.FEATURES:
         feats_dict[col] = computed_map[col]
 
@@ -1206,6 +1357,13 @@ def main():
     # 7c. Name frequency index and Channel K token map (name_freq, dict_name_ratio)
     t_nf = time.time()
     name_freq = NameFreq(cache_dir, args.split)
+    key_freqs = {
+        "a_s1": KeyFreq(cache_dir, args.split, ["source1"], "addr_norm"),
+        "a_pool": KeyFreq(cache_dir, args.split, ["source2", "source3"], "addr_norm"),
+        "k_s1": KeyFreq(cache_dir, args.split, ["source1"], "street_key"),
+        "k_pool": KeyFreq(cache_dir, args.split, ["source2", "source3"], "street_key"),
+    }
+    print(f"Key frequency indexes: " + ", ".join(f"{k} {len(v.keys):,}" for k, v in key_freqs.items()), flush=True)
     name_map = load_name_map(cache_dir)
     print(f"Name frequency index: {len(name_freq.keys):,} (country, core_name) keys; token map {len(name_map):,} entries "
           f"in {time.time() - t_nf:.1f}s (RSS {_rss_mb():.0f} MB)", flush=True)
@@ -1293,6 +1451,7 @@ def main():
             t_sb = time.time()
             sub_ctx = context_df.iloc[rows].reset_index(drop=True)
             ctx_gap, ctx_nc, ctx_sup = compute_context_features(sub_ctx, all_cand_emb, cand_id_map)
+            ctx_rel = relative_features(sub_ctx, ctx_sup, comb)
             sub_keep = ctx_keep[rows]
             if sub_keep.any():
                 kept_df = sub_ctx[sub_keep].reset_index(drop=True)
@@ -1300,8 +1459,9 @@ def main():
                 feats_df = compute_chunk_features(
                     kept_df, s1_norm, cands_norm, all_cand_emb, cand_id_map,
                     ctx_rr[rows][sub_keep], df_tokens,
-                    ctx_gap[sub_keep], ctx_nc[sub_keep], ctx_sup[sub_keep], comb=comb,
-                    name_freq=name_freq, name_map=name_map
+                    ctx_gap[sub_keep], ctx_nc[sub_keep], ctx_sup[sub_keep], comb=None,
+                    name_freq=name_freq, name_map=name_map,
+                    rel={k: v[sub_keep] for k, v in ctx_rel.items()}, key_freqs=key_freqs
                 )
                 part_tables.append(pa.Table.from_pandas(feats_df, preserve_index=False))
                 part_pos.append(kept_pos[rows][sub_keep])
@@ -1309,7 +1469,7 @@ def main():
                 del kept_df, feats_df
             else:
                 n_sb_kept = 0
-            del sub_ctx, ctx_gap, ctx_nc, ctx_sup, sub_keep
+            del sub_ctx, ctx_gap, ctx_nc, ctx_sup, sub_keep, ctx_rel
             _free_memory()
             print(f"    Sub-batch {bi + 1}/{len(batches)}: {len(rows):,} context rows, "
                   f"{n_sb_kept:,} feature rows in {time.time() - t_sb:.2f}s  (RSS {_rss_mb():.0f} MB)", flush=True)
