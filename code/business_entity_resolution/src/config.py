@@ -77,6 +77,9 @@ FEATURES = [
     "revtf_rank",
     "ch_dict",
     "comb_cos",
+    "s1_name_freq",
+    "cand_name_freq",
+    "dict_name_ratio",
     "n_channels",
     # Context Features
     "gap_to_best",

@@ -387,6 +387,42 @@ class CombEmbeddings:
         return res
 
 
+class NameFreq:
+    """
+    How many records (S1 + S2 + S3 of one split) share a (country, core_name) key. Keys are 64-bit hashes kept
+    as a sorted array with counts (no Python dict), built once per split.
+    """
+
+    def __init__(self, cache_dir: str, split: str):
+        hashes = []
+        for src in ("source1", "source2", "source3"):
+            t = pq.read_table(os.path.join(cache_dir, f"norm_{split}_{src}.parquet"), columns=["country", "core_name"])
+            hashes.append(self._hash(t["country"].to_numpy(zero_copy_only=False), t["core_name"].to_numpy(zero_copy_only=False)))
+            del t
+        self.keys, self.counts = np.unique(np.concatenate(hashes), return_counts=True)
+
+    @staticmethod
+    def _hash(country, core):
+        key = pd.Series(country).astype(str).str.cat(pd.Series(core).fillna("").astype(str), sep="\x1f")
+        return pd.util.hash_array(key.to_numpy(dtype=object))
+
+    def log_freq(self, country, core) -> np.ndarray:
+        h = self._hash(country, core)
+        pos = np.clip(np.searchsorted(self.keys, h), 0, len(self.keys) - 1)
+        cnt = np.where(self.keys[pos] == h, self.counts[pos], 0)
+        return np.log1p(cnt).astype(np.float32)
+
+
+def load_name_map(cache_dir: str) -> dict:
+    """Channel K token dictionary (cache/indic_dict.json); empty dict if missing."""
+    p = os.path.join(cache_dir, "indic_dict.json")
+    if not os.path.exists(p):
+        return {}
+    import json
+    with open(p, encoding="utf-8") as f:
+        return json.load(f)
+
+
 def _arrow_ids_to_int(col) -> np.ndarray:
     """'S2-12345' strings (arrow) -> int64 source_digit * 10^12 + number (same encoding as _id_to_int)."""
     import pyarrow.compute as pc
@@ -475,7 +511,7 @@ def compute_context_features(context_df, all_cand_emb, cand_id_map):
 
 def compute_chunk_features(chunk_df, s1_df, cands_df, all_cand_emb, cand_id_map,
                            global_reverse_rank, df_tokens,
-                           ctx_gap_to_best, ctx_n_cands, ctx_support, comb=None):
+                           ctx_gap_to_best, ctx_n_cands, ctx_support, comb=None, name_freq=None, name_map=None):
     """
     Extracts all 31 features and rule_score for a candidate chunk without row-wise loops.
     Token sets and lengths are computed locally only for rows in this chunk.
@@ -608,6 +644,25 @@ def compute_chunk_features(chunk_df, s1_df, cands_df, all_cand_emb, cand_id_map,
     ], dtype=np.float32)
     del s1_r3_map, c_r3_map, s1_r3, c_r3
 
+    # 11b. name_freq: log1p(#records of the split sharing (country, core_name)), for S1 and candidate
+    if name_freq is not None:
+        s1_name_freq = name_freq.log_freq(s1_sub['country'].astype(str).values, s1_sub['core_name'].values)
+        cand_name_freq = name_freq.log_freq(cand_sub['country'].astype(str).values, cand_sub['core_name'].values)
+    else:
+        s1_name_freq = np.full(n_pairs, np.nan, dtype=np.float32)
+        cand_name_freq = np.full(n_pairs, np.nan, dtype=np.float32)
+
+    # 11c. dict_name_ratio: token_sort_ratio(S1 name_full, candidate name_full after the Channel K token map)
+    if name_map:
+        c_map = {cid: " ".join(name_map.get(t, t) for t in str(x).split())
+                 for cid, x in zip(chunk_c_unique, cands_df.loc[chunk_c_unique, 'name_full'])}
+        c_dict_names = [c_map[cid] for cid in cand_ids]
+        del c_map
+    else:
+        c_dict_names = c_nf
+    dict_name_ratio = process.cpdist(s1_nf, c_dict_names, scorer=fuzz.token_sort_ratio, workers=-1).astype(np.float32)
+    del c_dict_names
+
     # 12. addr_missing_any: 1 if address empty on either side, else 0
     addr_missing_any = ((np.array(s1_ad) == '') | (np.array(c_ad) == '')).astype(np.float32)
     del s1_nf, c_nf, s1_cn, c_cn, s1_sk, c_sk, s1_ad, c_ad, s1_sub, cand_sub
@@ -683,6 +738,7 @@ def compute_chunk_features(chunk_df, s1_df, cands_df, all_cand_emb, cand_id_map,
         'ch_rerank': ch_rerank, 'ch_keyx': ch_keyx, 'ch_comb': ch_comb,
         'ch_tfidf': ch_tfidf, 'tfidf_rank': tfidf_rank, 'tfidf_score': tfidf_score,
         'ch_revtf': ch_revtf, 'revtf_rank': revtf_rank, 'ch_dict': ch_dict, 'comb_cos': comb_cos,
+        's1_name_freq': s1_name_freq, 'cand_name_freq': cand_name_freq, 'dict_name_ratio': dict_name_ratio,
         'n_channels': n_channels, 'gap_to_best': gap_to_best, 'n_cands': n_cands,
         'reverse_rank': reverse_rank, 'support': support
     }
@@ -1108,6 +1164,13 @@ def main():
         comb = None
         print(f"WARNING: {e}; comb_cos will be NaN", flush=True)
 
+    # 7c. Name frequency index and Channel K token map (name_freq, dict_name_ratio)
+    t_nf = time.time()
+    name_freq = NameFreq(cache_dir, args.split)
+    name_map = load_name_map(cache_dir)
+    print(f"Name frequency index: {len(name_freq.keys):,} (country, core_name) keys; token map {len(name_map):,} entries "
+          f"in {time.time() - t_nf:.1f}s (RSS {_rss_mb():.0f} MB)", flush=True)
+
     # Baseline memory breakdown
     s1_mem = s1_norm.memory_usage(deep=True).sum() / 1_048_576
     cands_mem = cands_norm.memory_usage(deep=True).sum() / 1_048_576
@@ -1198,7 +1261,8 @@ def main():
                 feats_df = compute_chunk_features(
                     kept_df, s1_norm, cands_norm, all_cand_emb, cand_id_map,
                     ctx_rr[rows][sub_keep], df_tokens,
-                    ctx_gap[sub_keep], ctx_nc[sub_keep], ctx_sup[sub_keep], comb=comb
+                    ctx_gap[sub_keep], ctx_nc[sub_keep], ctx_sup[sub_keep], comb=comb,
+                    name_freq=name_freq, name_map=name_map
                 )
                 part_tables.append(pa.Table.from_pandas(feats_df, preserve_index=False))
                 part_pos.append(kept_pos[rows][sub_keep])
